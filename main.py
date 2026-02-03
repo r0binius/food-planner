@@ -1,6 +1,10 @@
 import random
 from enum import Enum
 
+# Statt direkter Item-Objekt-Definitionen:
+# from items import ITEMS_DATA
+from items import ITEMS_DATA
+
 
 class MealType(Enum):
     BREAKFAST = "breakfast"
@@ -57,6 +61,12 @@ class Item:
         if self.standard_portion_size is None:
             return None
         return self.nutrients_for(self.standard_portion_size)
+
+    def step_grams(self) -> float:
+        # Wie darf dieses Item "erhöht" werden?
+        if self.standard_portion_size is not None:
+            return self.standard_portion_size
+        return 10.0
 
 
 class Portion:
@@ -199,87 +209,110 @@ def default_grams(item: Item) -> float:
     return 100.0
 
 
+def protein_per_calorie(item: Item) -> float:
+    # Schutz gegen division by zero
+    if item.calories_per_100 <= 0:
+        return 0.0
+    return item.protein_per_100 / item.calories_per_100
+
+
 def generate_day_plan(
     items: list[Item], goals: Goals, seed: int | None = None
 ) -> DayPlan:
     rng = random.Random(seed)
     plan = DayPlan()
 
-    # 1) Basis-Füllung: je Mahlzeit 1 Item
+    # 1) Basis: je Mahlzeit 1 Item (Startportion)
     for mt in [MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER]:
         pool = items_for_meal(items, mt)
-        if not pool:
-            raise ValueError(f"No items available for {mt.value}")
         it = rng.choice(pool)
         plan.add(mt, Portion(it, grams=default_grams(it)))
 
-    # 2) Repair: wenn Protein zu niedrig, addiere/erhöhe proteinreiche Items
-    # (MVP: sehr simple Heuristik)
-    for _ in range(30):  # 30 kleine Schritte
+    def add_best_item(mt: MealType, candidates: list[Item]) -> None:
+        # Füge eine step-Portion des besten Kandidaten zu mt hinzu
+        best = candidates[0]
+        best_score = protein_per_calorie(best)
+        for it in candidates[1:]:
+            s = protein_per_calorie(it)
+            if s > best_score:
+                best = it
+                best_score = s
+        plan.add(mt, Portion(best, grams=best.step_grams()))
+
+    # 2) Protein-Repair (gezielt)
+    for _ in range(60):
         n = plan.nutrients()
-        if (
-            n.get("protein", 0.0) >= goals.protein_min
-            and abs(n.get("calories", 0.0) - goals.calories_target) <= 150
-        ):
+        if n.get("protein", 0.0) >= goals.protein_min:
             break
 
-        # Wähle Mahlzeit zufällig und erhöhe dort ein Item in 10g Schritten
-        mt = rng.choice([MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER])
-        meal = plan.meals[mt]
+        # wähle die Mahlzeit, wo das Hinzufügen am sinnvollsten ist (z.B. Lunch/Dinner)
+        mt = rng.choice([MealType.LUNCH, MealType.DINNER, MealType.BREAKFAST])
+        pool = items_for_meal(items, mt)
 
-        # Falls keine Portionen: skip (sollte nicht passieren)
-        if not meal.portions:
-            continue
+        # Kandidaten: Items mit "vernünftigem" Protein
+        pool = [it for it in pool if it.protein_per_100 > 5]
+        if not pool:
+            # kein Protein-Item vorhanden -> nichts zu tun
+            break
 
-        # Erhöhe random Portion
-        p = rng.choice(meal.portions)
-        p.grams += 10.0  # einfache Schrittgröße
+        add_best_item(mt, pool)
+
+    # 3) Kalorien-Repair (auffüllen)
+    for _ in range(80):
+        n = plan.nutrients()
+        cal = n.get("calories", 0.0)
+
+        if abs(cal - goals.calories_target) <= 150:
+            break
+        if cal > goals.calories_target + 150:
+            break  # zu hoch, wir machen MVP und reduzieren nicht
+
+        # Fülle bevorzugt mit Carb-lastigen Sachen (Reis/Haferflocken)
+        # Sehr simple Heuristik: max carbs_per_100 bei moderatem Fett
+        all_candidates = []
+        for mt in [MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER]:
+            pool = items_for_meal(items, mt)
+            all_candidates += [(mt, it) for it in pool]
+
+        # pick best carb-heavy item
+        best_mt, best_it = all_candidates[0]
+        best_score = best_it.carbs_per_100 - best_it.fat_per_100 * 2.0
+
+        for mt, it in all_candidates[1:]:
+            s = it.carbs_per_100 - it.fat_per_100 * 2.0
+            if s > best_score:
+                best_score = s
+                best_mt, best_it = mt, it
+
+        plan.add(best_mt, Portion(best_it, grams=best_it.step_grams()))
 
     return plan
 
 
-peanut_butter = Item(
-    "Erdnussbutter", 606, 47.9, 15.0, 24.6, 8.4, 0.83, {MealType.BREAKFAST}
-)
-rice = Item(
-    "Reis",
-    360,
-    0.6,
-    78,
-    7.5,
-    1.3,
-    0.01,
-    {MealType.LUNCH, MealType.DINNER},
-    standard_portion_size=125,
-    standard_portion_name="Beutel",
-)
+def load_items_from_data(data) -> list[Item]:
+    result: list[Item] = []
+    for d in data:
+        # meal_types als Menge von MealType-Enums erzeugen
+        mts = {MealType[mt] for mt in d.get("meal_types", [])}
+        item = Item(
+            d["name"],
+            d["calories_per_100"],
+            d["fat_per_100"],
+            d["carbs_per_100"],
+            d["protein_per_100"],
+            d["fibre_per_100"],
+            d["salt_per_100"],
+            mts,
+            standard_portion_size=d.get("standard_portion_size"),
+            standard_portion_name=d.get("standard_portion_name"),
+        )
+        result.append(item)
+    return result
 
-skyr = Item(
-    "Skyr",
-    63,
-    0.2,
-    3.9,
-    11.0,
-    0.0,
-    0.1,
-    {MealType.BREAKFAST},
-    standard_portion_size=250,
-    standard_portion_name="Becher",
-)
 
-chicken = Item(
-    "Hähnchenbrust",
-    110,
-    1.5,
-    0.0,
-    23.0,
-    0.0,
-    0.2,
-    {MealType.LUNCH, MealType.DINNER},
-)
+items = load_items_from_data(ITEMS_DATA)
 
-items = [peanut_butter, rice, skyr, chicken]
-
+# Der Rest bleibt gleich: goals, plan, prints ...
 goals = Goals(calories_target=2200, protein_min=150, fat_max=80)
 
 plan = generate_day_plan(items, goals, seed=42)
