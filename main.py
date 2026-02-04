@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 import random
 from enum import Enum
+from typing import List
 
 # Statt direkter Item-Objekt-Definitionen:
 # from items import ITEMS_DATA
@@ -15,11 +17,16 @@ class MealType(Enum):
 class Item:
     """
     Arbeitet ausschließlich mit Nährwerten pro Portion (preferred).
+
     Felder:
       - calories_per_portion, fat_per_portion, carbs_per_portion,
         protein_per_portion, fibre_per_portion, salt_per_portion
       - meal_types: Menge von MealType
       - optional: standard_portion_name (z.B. "Plate", "Bowl")
+      - optional: max_portions (float) — Maximale Anzahl Standard-Portionen pro Tag
+      - optional runtime-only attribute: lunch_role ("MAIN" oder "SIDE")
+        Wird beim Laden aus Daten gesetzt, wenn vorhanden. Falls nicht gesetzt,
+        kann die Logik beim Erstellen des Mittagessens eine Rolle inferieren.
     """
 
     def __init__(
@@ -33,6 +40,7 @@ class Item:
         salt_per_portion: float | None,
         meal_types: set[MealType] = set(),
         standard_portion_name: str | None = None,
+        max_portions: float | None = None,
     ) -> None:
         self.name = name
 
@@ -63,6 +71,18 @@ class Item:
         self.meal_types: set[MealType] = meal_types
         self.standard_portion_name: str | None = standard_portion_name
 
+        # optional: maximum standard portions allowed for this item (per day)
+        if max_portions is not None:
+            mp = float(max_portions)
+            if mp <= 0:
+                raise ValueError("max_portions must be > 0")
+            self.max_portions: float | None = mp
+        else:
+            self.max_portions = None
+
+        # lunch_role is optional runtime metadata: "MAIN", "SIDE", or None
+        self.lunch_role: str | None = None
+
     def nutrients_for_portions(self, portions: float) -> dict[str, float]:
         """
         Liefert Nährwerte für die angegebene Anzahl Portionen.
@@ -84,6 +104,9 @@ class Item:
         """
         return 1.0
 
+    def __repr__(self) -> str:
+        return f"Item({self.name})"
+
 
 class Portion:
     """
@@ -96,6 +119,12 @@ class Portion:
         sp = float(standard_portions)
         if sp <= 0:
             raise ValueError("standard_portions must be > 0")
+        # Enforce item-level max_portions (per day) if set
+        maxp = getattr(item, "max_portions", None)
+        if maxp is not None and sp > maxp:
+            raise ValueError(
+                f"standard_portions ({sp}) exceeds item's max_portions ({maxp})"
+            )
         self.portions = sp
 
     def nutrients(self) -> dict[str, float]:
@@ -130,6 +159,9 @@ class Meal:
             total = add_nutrients(total, p.nutrients())
         return total
 
+    def __repr__(self) -> str:
+        return f"Meal({self.meal_type}, portions={self.portions})"
+
 
 class Goals:
     def __init__(
@@ -154,6 +186,18 @@ class DayPlan:
         }
 
     def add(self, meal_type: MealType, portion: Portion) -> None:
+        # Enforce item-level max_portions across the whole DayPlan (per day)
+        maxp = getattr(portion.item, "max_portions", None)
+        if maxp is not None:
+            current_total = 0.0
+            for meal in self.meals.values():
+                for p in meal.portions:
+                    if p.item is portion.item:
+                        current_total += p.portions
+            if current_total + portion.portions > maxp:
+                raise ValueError(
+                    f"Cannot add {portion.portions} portions of {portion.item.name}: would exceed max_portions ({maxp})"
+                )
         self.meals[meal_type].add(portion)
 
     def nutrients(self) -> dict[str, float]:
@@ -192,7 +236,7 @@ class DayPlan:
         return round(score, 2)
 
 
-def items_for_meal(items: list[Item], meal_type: MealType) -> list[Item]:
+def items_for_meal(items: List[Item], meal_type: MealType) -> List[Item]:
     return [i for i in items if meal_type in i.meal_types]
 
 
@@ -213,8 +257,92 @@ def protein_per_calorie(item: Item) -> float:
     return protein / calories
 
 
+def pick_lunch_pair(rng: random.Random, pool: List[Item]) -> tuple[Item, Item]:
+    """
+    Wählt ein Lunch-Paar (main, side) aus dem Pool aus.
+
+    Regeln:
+      - Das Ergebnis muss genau ein MAIN und genau ein SIDE liefern.
+      - Wenn explizite MAIN/SIDE Rollen vorhanden sind, wähle je eine davon.
+      - Wenn nur eine Seite der Rollen vorhanden ist (z.B. nur MAIN), versuche
+        eine passende Gegenrolle aus dem Pool zu wählen und markiere sie als
+        notwendigerweise SIDE (oder MAIN), damit nicht zwei gleiche Rollen kombiniert werden.
+      - Wenn keine Rollen gesetzt sind, wähle zwei unterschiedliche Items und
+        inferiere MAIN/SIDE nach Kalorien (höhere Kalorien = MAIN).
+      - Wenn nur ein Item verfügbar ist, verwende es doppelt (main==side).
+    """
+    mains = [i for i in pool if getattr(i, "lunch_role", None) == "MAIN"]
+    sides = [i for i in pool if getattr(i, "lunch_role", None) == "SIDE"]
+
+    # Case A: both explicit mains and sides -> pick one each
+    if mains and sides:
+        main = rng.choice(mains)
+        side_candidates = [s for s in sides if s is not main]
+        side = rng.choice(side_candidates) if side_candidates else rng.choice(sides)
+        # ensure roles set
+        main.lunch_role = main.lunch_role or "MAIN"
+        side.lunch_role = side.lunch_role or "SIDE"
+        return main, side
+
+    # Case B: explicit mains only -> pick a main and pick a non-main as side if possible
+    if mains and not sides:
+        main = rng.choice(mains)
+        non_main_candidates = [i for i in pool if i is not main]
+        if non_main_candidates:
+            side = rng.choice(non_main_candidates)
+            # ensure roles are MAIN and SIDE (avoid combining two explicit MAINs)
+            main.lunch_role = main.lunch_role or "MAIN"
+            side.lunch_role = side.lunch_role or "SIDE"
+            return main, side
+        # If every candidate is also marked MAIN but there are at least two items, force one to SIDE
+        if len(mains) >= 2:
+            # pick a different mains item to act as side
+            other = rng.choice([m for m in mains if m is not main])
+            main.lunch_role = main.lunch_role or "MAIN"
+            other.lunch_role = "SIDE"
+            return main, other
+
+    # Case C: explicit sides only -> symmetric handling
+    if sides and not mains:
+        side = rng.choice(sides)
+        non_side_candidates = [i for i in pool if i is not side]
+        if non_side_candidates:
+            main = rng.choice(non_side_candidates)
+            main.lunch_role = main.lunch_role or "MAIN"
+            side.lunch_role = side.lunch_role or "SIDE"
+            return main, side
+        if len(sides) >= 2:
+            other = rng.choice([s for s in sides if s is not side])
+            other.lunch_role = "MAIN"
+            side.lunch_role = side.lunch_role or "SIDE"
+            return other, side
+
+    # Case D: no explicit roles -> choose two distinct items if possible
+    unique_pool = list(dict.fromkeys(pool))  # preserve order but unique
+    if len(unique_pool) >= 2:
+        a, b = rng.sample(unique_pool, 2)
+        # infer roles by calories (higher = MAIN)
+        if a.calories_per_portion >= b.calories_per_portion:
+            a.lunch_role = a.lunch_role or "MAIN"
+            b.lunch_role = b.lunch_role or "SIDE"
+            return a, b
+        else:
+            a.lunch_role = a.lunch_role or "SIDE"
+            b.lunch_role = b.lunch_role or "MAIN"
+            return b, a
+
+    # Case E: only one item available -> use it for both roles (two portions)
+    if len(unique_pool) == 1:
+        single = unique_pool[0]
+        # mark as MAIN by default (and can be SIDE as well)
+        single.lunch_role = single.lunch_role or "MAIN"
+        return single, single
+
+    raise ValueError("No lunch candidates available")
+
+
 def generate_day_plan(
-    items: list[Item], goals: Goals, seed: int | None = None
+    items: List[Item], goals: Goals, seed: int | None = None
 ) -> DayPlan:
     rng = random.Random(seed)
     plan = DayPlan()
@@ -222,16 +350,36 @@ def generate_day_plan(
     # Kalorien-Limit (nicht mehr als target + 100 kcal)
     cal_limit = goals.calories_target + 100.0
 
-    # 1) Basis: je Mahlzeit 1 Item (Startportion)
-    for mt in [MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER]:
+    # 1) Basis: je Mahlzeit Startportionen
+    # Breakfast and dinner: jeweils ein Gericht
+    for mt in [MealType.BREAKFAST, MealType.DINNER]:
         pool = items_for_meal(items, mt)
+        if not pool:
+            raise ValueError(f"No items for meal type {mt}")
         it = rng.choice(pool)
         plan.add(mt, Portion(it, standard_portions=default_portions(it)))
 
-    def add_best_item(mt: MealType, candidates: list[Item], cal_limit: float) -> bool:
+    # Lunch: Baue aus MAIN + SIDE
+    lunch_pool = items_for_meal(items, MealType.LUNCH)
+    if not lunch_pool:
+        raise ValueError("No items for lunch available")
+    main_item, side_item = pick_lunch_pair(rng, lunch_pool)
+
+    # Wenn main==side (nur ein Item im Pool), fügen wir zwei Portionen derselben Item hinzu.
+    plan.add(
+        MealType.LUNCH,
+        Portion(main_item, standard_portions=default_portions(main_item)),
+    )
+    plan.add(
+        MealType.LUNCH,
+        Portion(side_item, standard_portions=default_portions(side_item)),
+    )
+
+    def add_best_item(mt: MealType, candidates: List[Item], cal_limit: float) -> bool:
         """
         Versucht, einen Schritt (step_portions) des besten Kandidaten zu mt hinzuzufügen,
-        wobei darauf geachtet wird, das gegebene Kalorien-Limit nicht zu überschreiten.
+        wobei darauf geachtet wird, das gegebene Kalorien-Limit nicht zu überschreiten
+        und item.max_portions zu respektieren.
         Bewertungs-Kriterium: zusätzliches Protein pro zusätzlicher Kalorie.
         Gibt True zurück, wenn etwas hinzugefügt wurde, sonst False.
         """
@@ -241,6 +389,18 @@ def generate_day_plan(
 
         for it in candidates:
             step = it.step_portions()
+            # respect item-level max_portions against current plan
+            maxp = getattr(it, "max_portions", None)
+            if maxp is not None:
+                current_item_total = 0.0
+                for meal in plan.meals.values():
+                    for p in meal.portions:
+                        if p.item is it:
+                            current_item_total += p.portions
+                if current_item_total + step > maxp:
+                    # would exceed the allowed maximum for this item; skip
+                    continue
+
             added_cal = it.calories_per_portion * step
             if added_cal <= 0:
                 continue
@@ -249,7 +409,7 @@ def generate_day_plan(
                 continue
             added_protein = (it.protein_per_portion or 0.0) * step
             # Score: protein per added calorie
-            s = added_protein / added_cal
+            s = added_protein / added_cal if added_cal > 0 else 0.0
             if s > best_score:
                 best_score = s
                 best = it
@@ -261,6 +421,8 @@ def generate_day_plan(
         return True
 
     # 2) Protein-Repair (gezielt), respektiere cal_limit
+    # Hinweis: Ursprünglich war Lunch unverändert, aber in dieser Variante erlauben
+    # Reparatur-Schritte auch zusätzliche Lunch-Portionen. Daher betrachten wir Breakfast, Lunch und Dinner.
     for _ in range(200):
         n = plan.nutrients()
         if n.get("protein", 0.0) >= goals.protein_min:
@@ -272,9 +434,15 @@ def generate_day_plan(
             break
 
         added = False
-        # Versuche für verschiedene Mahlzeiten, etwas hinzuzufügen
-        for mt in [MealType.LUNCH, MealType.DINNER, MealType.BREAKFAST]:
+        # Versuche für verschiedene Mahlzeiten, etwas hinzuzufügen.
+        # Wenn wir Lunch betrachten, dürfen wir nur zusätzliche Portionen von Items
+        # hinzufügen, die bereits in der Lunch-Mahlzeit vorhanden sind (keine neuen Lunch-Items).
+        for mt in [MealType.DINNER, MealType.BREAKFAST, MealType.LUNCH]:
             pool = items_for_meal(items, mt)
+            # Wenn Lunch: nur bereits vorhandene Lunch-Items erlauben
+            if mt is MealType.LUNCH:
+                existing = [p.item for p in plan.meals[MealType.LUNCH].portions]
+                pool = [it for it in pool if it in existing]
             # Kandidaten: Items mit "vernünftigem" Protein (per portion)
             pool = [it for it in pool if (it.protein_per_portion or 0.0) > 5]
             if not pool:
@@ -300,10 +468,30 @@ def generate_day_plan(
 
         # Fülle bevorzugt mit Carb-lastigen Sachen (Reis/Haferflocken)
         # Heuristik: max carbs_per_portion bei moderatem Fett
-        all_candidates = []
-        for mt in [MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER]:
+        all_candidates: list[tuple[MealType, Item]] = []
+        # Fülle Breakfast, Dinner und Lunch — Lunch kann hier ebenfalls ergänzt werden,
+        # jedoch nur durch bereits vorhandene Lunch-Items (keine neuen Lunch-Items).
+        for mt in [MealType.BREAKFAST, MealType.DINNER, MealType.LUNCH]:
             pool = items_for_meal(items, mt)
-            all_candidates += [(mt, it) for it in pool]
+            # Wenn Lunch: nur bereits vorhandene Lunch-Items erlauben
+            if mt is MealType.LUNCH:
+                existing = [p.item for p in plan.meals[MealType.LUNCH].portions]
+                pool = [it for it in pool if it in existing]
+            for it in pool:
+                # Prüfe, ob das Item durch einen Schritt das max_portions Limit verletzen würde
+                step = it.step_portions()
+                maxp = getattr(it, "max_portions", None)
+                current_item_total = 0.0
+                for meal in plan.meals.values():
+                    for p in meal.portions:
+                        if p.item is it:
+                            current_item_total += p.portions
+                if maxp is not None and current_item_total + step > maxp:
+                    continue  # überspringe dieses Item
+                all_candidates.append((mt, it))
+
+        if not all_candidates:
+            break
 
         # pick best carb-heavy item
         best_mt, best_it = all_candidates[0]
@@ -322,7 +510,7 @@ def generate_day_plan(
                 best_score = s
                 best_mt, best_it = mt, it
 
-        # Nur hinzufügen, wenn wir das cal_limit nicht überschreiten
+        # Nur hinzufügen, wenn wir das cal_limit nicht überschreiten und nicht max_portions verletzen
         added_cal = best_it.calories_per_portion * best_it.step_portions()
         if cal + added_cal <= cal_limit:
             plan.add(
@@ -336,8 +524,8 @@ def generate_day_plan(
     return plan
 
 
-def load_items_from_data(data) -> list[Item]:
-    result: list[Item] = []
+def load_items_from_data(data) -> List[Item]:
+    result: List[Item] = []
     for d in data:
         # meal_types als Menge von MealType-Enums erzeugen
         mts = {MealType[mt] for mt in d.get("meal_types", [])}
@@ -353,19 +541,36 @@ def load_items_from_data(data) -> list[Item]:
             d.get("salt_per_portion"),
             mts,
             standard_portion_name=d.get("standard_portion_name"),
+            max_portions=d.get("max_portions"),
         )
+
+        # Optional: lade explizite Lunch-Rolle (wenn in ITEMS_DATA vorhanden).
+        # Erwarteter Wert: "MAIN" oder "SIDE" (case-insensitive).
+        lr = d.get("lunch_role")
+        if lr:
+            lr_up = str(lr).upper()
+            if lr_up in ("MAIN", "SIDE"):
+                item.lunch_role = lr_up
+
         result.append(item)
     return result
 
 
+# Lade Items
 items = load_items_from_data(ITEMS_DATA)
 
-# Der Rest bleibt gleich: goals, plan, prints ...
-goals = Goals(calories_target=2200, protein_min=150, fat_max=80)
+# Beispiel Goals und Ausführung
+goals = Goals(calories_target=2100, protein_min=160, fat_max=80)
 
 plan = generate_day_plan(items, goals, seed=42)
 
 print("Day nutrients:", plan.nutrients())
 print("Score:", plan.score(goals))
 for mt, meal in plan.meals.items():
-    print(mt.value, meal.portions)
+    # Aggregierte Nährwerte pro Mahlzeit zusätzlich ausgeben
+    mn = meal.nutrients()
+    print(f"{mt.value.capitalize()}:")
+    print("  portions:", meal.portions)
+    print("  nutrients:")
+    for k, v in mn.items():
+        print(f"    {k}: {v}")
