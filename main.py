@@ -560,7 +560,7 @@ def load_items_from_data(data) -> List[Item]:
 items = load_items_from_data(ITEMS_DATA)
 
 # Beispiel Goals und Ausführung
-goals = Goals(calories_target=2100, protein_min=160, fat_max=80)
+goals = Goals(calories_target=1733, protein_min=106, fat_max=56)
 
 plan = generate_day_plan(items, goals, seed=42)
 
